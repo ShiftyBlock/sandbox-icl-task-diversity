@@ -1,15 +1,12 @@
 from typing import Any
 
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
-import tensorflow_probability.substrates.jax as tfp
-from jax import Array
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Normal
 
 import icl.utils as u
-from icl.gpt2 import GPT2Config, GPT2Model, init_fn
-
-tfd = tfp.distributions
+from icl.gpt2 import GPT2Config, GPT2Model
 
 
 ########################################################################################################################
@@ -34,26 +31,35 @@ def get_model_name(model):
 
 
 class Transformer(nn.Module):
-    n_points: int
-    n_layer: int
-    n_embd: int
-    n_head: int
-    seed: int
-    dtype: Any
+    def __init__(self, n_points: int, n_layer: int, n_embd: int, n_head: int, seed: int, dtype: Any):
+        super().__init__()
+        self.n_points = n_points
+        self.n_layer = n_layer
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.seed = seed
+        self.dtype = dtype
 
-    def setup(self):
         config = GPT2Config(
-            block_size=2 * self.n_points,
-            n_layer=self.n_layer,
-            n_head=self.n_head,
-            n_embd=self.n_embd,
-            dtype=self.dtype,
+            block_size=2 * n_points,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_embd=n_embd,
+            dtype=dtype,
         )
-        self._in = nn.Dense(self.n_embd, False, self.dtype, kernel_init=init_fn)
+        self._in = nn.Linear(n_embd + 1, n_embd, bias=False, dtype=dtype)
         self._h = GPT2Model(config)
-        self._out = nn.Dense(1, False, self.dtype, kernel_init=init_fn)
+        self._out = nn.Linear(n_embd, 1, bias=False, dtype=dtype)
 
-    def __call__(self, data: Array, targets: Array, training: bool = False) -> Array:
+        # Initialize weights
+        torch.manual_seed(seed)
+        self._init_weights()
+
+    def _init_weights(self):
+        torch.nn.init.normal_(self._in.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self._out.weight, mean=0.0, std=0.02)
+
+    def forward(self, data: torch.Tensor, targets: torch.Tensor, training: bool = False) -> torch.Tensor:
         input_seq = u.to_seq(data, targets)
         embds = self._in(input_seq)
         outputs = self._h(input_embds=embds, training=training)
@@ -68,27 +74,29 @@ class Transformer(nn.Module):
 
 
 class Ridge(nn.Module):
-    lam: float
-    dtype: Any
+    def __init__(self, lam: float, dtype: Any):
+        super().__init__()
+        self.lam = lam
+        self.dtype = dtype
 
-    def __call__(self, data: Array, targets: Array) -> Array:
+    def forward(self, data: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            xs: batch_size x n_points x n_dims (float)
-            ys: batch_size x n_points (float)
+            data: batch_size x n_points x n_dims (float)
+            targets: batch_size x n_points (float)
         Return:
             batch_size x n_points (float)
         """
         batch_size, n_points, _ = data.shape
-        targets = jnp.expand_dims(targets, -1)  # batch_size x n_points x 1
-        preds = [jnp.zeros(batch_size, dtype=self.dtype)]
+        targets = targets.unsqueeze(-1)  # batch_size x n_points x 1
+        preds = [torch.zeros(batch_size, dtype=self.dtype, device=data.device)]
         preds.extend(
             [self.predict(data[:, :_i], targets[:, :_i], data[:, _i : _i + 1], self.lam) for _i in range(1, n_points)]
         )
-        preds = jnp.stack(preds, axis=1)
+        preds = torch.stack(preds, dim=1)
         return preds
 
-    def predict(self, X: Array, Y: Array, test_x: Array, lam: float) -> Array:
+    def predict(self, X: torch.Tensor, Y: torch.Tensor, test_x: torch.Tensor, lam: float) -> torch.Tensor:
         """
         Args:
             X: batch_size x i x n_dims (float)
@@ -99,11 +107,11 @@ class Ridge(nn.Module):
             batch_size (float)
         """
         _, _, n_dims = X.shape
-        XT = X.transpose((0, 2, 1))  # batch_size x n_dims x i
-        XT_Y = XT @ Y  # batch_size x n_dims x 1, @ should be ok (batched matrix-vector product)
-        ridge_matrix = jnp.matmul(XT, X, precision=jax.lax.Precision.HIGHEST) + lam * jnp.eye(n_dims, dtype=self.dtype)  # batch_size x n_dims x n_dims
+        XT = X.transpose(1, 2)  # batch_size x n_dims x i
+        XT_Y = XT @ Y  # batch_size x n_dims x 1
+        ridge_matrix = torch.matmul(XT, X) + lam * torch.eye(n_dims, dtype=self.dtype, device=X.device).unsqueeze(0)  # batch_size x n_dims x n_dims
         # batch_size x n_dims x 1
-        ws = jnp.linalg.solve(ridge_matrix.astype(jnp.float32), XT_Y.astype(jnp.float32)).astype(self.dtype)
+        ws = torch.linalg.solve(ridge_matrix.float(), XT_Y.float()).to(self.dtype)
         pred = test_x @ ws  # @ should be ok (batched row times column)
         return pred[:, 0, 0]
 
@@ -114,11 +122,13 @@ class Ridge(nn.Module):
 
 
 class DiscreteMMSE(nn.Module):
-    scale: float
-    task_pool: Array  # n_tasks x n_dims x 1
-    dtype: Any
+    def __init__(self, scale: float, task_pool: torch.Tensor, dtype: Any):
+        super().__init__()
+        self.scale = scale
+        self.dtype = dtype
+        self.register_buffer('task_pool', task_pool)  # n_tasks x n_dims x 1
 
-    def __call__(self, data: Array, targets: Array) -> Array:
+    def forward(self, data: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
         Args:
             data: batch_size x n_points x n_dims (float)
@@ -127,19 +137,19 @@ class DiscreteMMSE(nn.Module):
             batch_size x n_points (float)
         """
         _, n_points, _ = data.shape
-        targets = jnp.expand_dims(targets, -1)  # batch_size x n_points x 1
-        W = self.task_pool.squeeze().T  # n_dims x n_tasks  (maybe do squeeze and transpose in setup?)
-        preds = [data[:, 0] @ W.mean(axis=1)]  # batch_size
+        targets = targets.unsqueeze(-1)  # batch_size x n_points x 1
+        W = self.task_pool.squeeze().T  # n_dims x n_tasks
+        preds = [data[:, 0] @ W.mean(dim=1)]  # batch_size
         preds.extend(
             [
                 self.predict(data[:, :_i], targets[:, :_i], data[:, _i : _i + 1], W, self.scale)
                 for _i in range(1, n_points)
             ]
         )
-        preds = jnp.stack(preds, axis=1)  # batch_size x n_points
+        preds = torch.stack(preds, dim=1)  # batch_size x n_points
         return preds
 
-    def predict(self, X: Array, Y: Array, test_x: Array, W: Array, scale: float) -> Array:
+    def predict(self, X: torch.Tensor, Y: torch.Tensor, test_x: torch.Tensor, W: torch.Tensor, scale: float) -> torch.Tensor:
         """
         Args:
             X: batch_size x i x n_dims (float)
@@ -151,10 +161,11 @@ class DiscreteMMSE(nn.Module):
             batch_size (float)
         """
         # X @ W is batch_size x i x n_tasks, Y is batch_size x i x 1, so broadcasts to alpha being batch_size x n_tasks
-        alpha = tfd.Normal(0, scale).log_prob(Y - jnp.matmul(X, W, precision=jax.lax.Precision.HIGHEST)).astype(self.dtype).sum(axis=1)
+        dist = Normal(0, scale)
+        alpha = dist.log_prob(Y - torch.matmul(X, W)).to(self.dtype).sum(dim=1)
         # softmax is batch_size x n_tasks, W.T is n_tasks x n_dims, so w_mmse is batch_size x n_dims x 1
-        w_mmse = jnp.expand_dims(jnp.matmul(jax.nn.softmax(alpha, axis=1), W.T, precision=jax.lax.Precision.HIGHEST), -1)
-        # test_x is batch_size x 1 x n_dims, so pred is batch_size x 1 x 1. NOTE: @ should be ok (batched row times column)
+        w_mmse = torch.matmul(F.softmax(alpha, dim=1), W.T).unsqueeze(-1)
+        # test_x is batch_size x 1 x n_dims, so pred is batch_size x 1 x 1
         pred = test_x @ w_mmse
         return pred[:, 0, 0]
 
