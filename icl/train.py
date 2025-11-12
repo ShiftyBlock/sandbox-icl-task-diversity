@@ -79,18 +79,18 @@ def train(config) -> None:
 
     # Model, optimizer and lr schedule
     dtype = getattr(torch, config.dtype)
-    model = get_model(**config.model, dtype=dtype)
+    model = get_model(**vars(config.model), dtype=dtype)
     logging.info(u.tabulate_model(model, config.task.n_dims, config.task.n_points, config.task.batch_size))
     model = initialize(model, config, device)
-    optimizer, lr_schedule = get_optimizer_and_lr_schedule(**config.training, model=model)
+    optimizer, lr_schedule = get_optimizer_and_lr_schedule(**vars(config.training), model=model)
     logging.info("Initialized Model, Optimizer and LR Schedule")
 
     # Data samplers
-    train_task = get_task(**config.task, dtype=dtype, device=device)
+    train_task = get_task(**vars(config.task), dtype=dtype, device=device)
     sample_train_batch = get_batch_sampler(train_task)
     batch_samplers = {
         get_task_name(task): get_batch_sampler(task)
-        for task in train_task.get_default_eval_tasks(**config.eval)
+        for task in train_task.get_default_eval_tasks(**vars(config.eval))
     }
     logging.info("Initialized Data Samplers")
 
@@ -100,7 +100,7 @@ def train(config) -> None:
 
     # Loggers
     log = _init_log(bsln_preds, config.task.n_dims)
-    wandb.init(config=config.to_dict(), name=exp_name, **config.wandb)
+    wandb.init(config=config.to_dict(), name=exp_name, **vars(config.wandb))
 
     # Training loop
     logging.info("Start Train Loop")
