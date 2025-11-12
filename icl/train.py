@@ -1,17 +1,9 @@
 import json
 import os
+import logging
 
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-import orbax.checkpoint as oc
-import tensorflow as tf
-from absl import logging
-from flax import jax_utils
-from flax.core import FrozenDict
-from flax.training import checkpoints
-from flax.training.train_state import TrainState
-from jax import Array
+import torch
+import torch.nn as nn
 from ml_collections import ConfigDict
 
 import icl.utils as u
@@ -22,42 +14,35 @@ from icl.optim import get_optimizer_and_lr_schedule
 from icl.tasks import Sampler, Task, get_task, get_task_name
 
 
-def initialize(model: Transformer, config: ConfigDict) -> tuple[FrozenDict, Array]:
-    params_rng, dropout_rng = jr.split(jr.PRNGKey(config.model.seed))
-    dummy_data = jnp.ones((config.task.batch_size, config.task.n_points, config.task.n_dims), dtype=model.dtype)
-    dummy_targets = jnp.ones((config.task.batch_size, config.task.n_points), dtype=model.dtype)
-    variables = jax.jit(model.init)(params_rng, dummy_data, dummy_targets)
-    return variables["params"], dropout_rng
+def initialize(model: Transformer, config: ConfigDict, device: str) -> torch.nn.Module:
+    model = model.to(device)
+    return model
 
 
-def get_sharded_batch_sampler(task: Task) -> Sampler:
-    n_devices = jax.local_device_count()
-
-    def sample_batch(step: int) -> tuple[Array, Array, Array]:
+def get_batch_sampler(task: Task) -> Sampler:
+    def sample_batch(step: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch = task.sample_batch(step)
-        batch = jax.tree_map(lambda x: x.reshape(n_devices, -1, *x.shape[1:]), batch)
         return batch
-
     return sample_batch
 
 
-def train_step(state: TrainState, data: Array, targets: Array, dropout_rng: Array) -> TrainState:
-    dropout_rng = jr.fold_in(dropout_rng, state.step + 1)
+def train_step(model: nn.Module, optimizer: torch.optim.Optimizer, data: torch.Tensor, targets: torch.Tensor) -> float:
+    model.train()
+    optimizer.zero_grad()
 
-    def loss_fn(params):
-        preds = state.apply_fn({"params": params}, data, targets, training=True, rngs={"dropout": dropout_rng})
-        loss = jnp.square(preds - targets).mean()
-        return loss, preds
+    preds = model(data, targets, training=True)
+    loss = torch.square(preds - targets).mean()
 
-    grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-    _, grads = grad_fn(state.params)
-    grads = jax.lax.pmean(grads, axis_name="device")
-    state = state.apply_gradients(grads=grads)
-    return state
+    loss.backward()
+    optimizer.step()
+
+    return loss.item()
 
 
-def eval_step(state: TrainState, data: Array, targets: Array) -> Array:
-    preds = state.apply_fn({"params": state.params}, data, targets, training=False)
+def eval_step(model: nn.Module, data: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    model.eval()
+    with torch.no_grad():
+        preds = model(data, targets, training=False)
     return preds
 
 
@@ -74,49 +59,45 @@ def _init_log(bsln_preds: Preds, n_dims: int) -> dict:
 
 
 def train(config: ConfigDict) -> None:
+    # Setup device
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    logging.info(f"Using device: {device}")
+
     # Setup train experiment
     exp_name = f"train_{u.get_hash(config)}"
     exp_dir = os.path.join(config.work_dir, exp_name)
     logging.info(f"Train Experiment\nNAME: {exp_name}\nCONFIG:\n{config}")
+
     # Experiment completed?
-    if tf.io.gfile.exists(os.path.join(exp_dir, "log.json")):
+    if os.path.exists(os.path.join(exp_dir, "log.json")):
         logging.info(f"{exp_name} already completed")
         return None
+
     # Config
-    tf.io.gfile.makedirs(exp_dir)
-    with tf.io.gfile.GFile(os.path.join(exp_dir, "config.json"), "w") as f:
+    os.makedirs(exp_dir, exist_ok=True)
+    with open(os.path.join(exp_dir, "config.json"), "w") as f:
         f.write(config.to_json())
 
     # Model, optimizer and lr schedule
-    model = get_model(**config.model, dtype=jnp.dtype(config.dtype))
+    dtype = getattr(torch, config.dtype)
+    model = get_model(**config.model, dtype=dtype)
     logging.info(u.tabulate_model(model, config.task.n_dims, config.task.n_points, config.task.batch_size))
-    params, dropout_rng = initialize(model, config)
-    tx, lr = get_optimizer_and_lr_schedule(**config.training, params=params)
+    model = initialize(model, config, device)
+    optimizer, lr_schedule = get_optimizer_and_lr_schedule(**config.training, model=model)
     logging.info("Initialized Model, Optimizer and LR Schedule")
 
-    # Train state
-    state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
-    state = jax_utils.replicate(state)
-    dropout_rngs = jr.split(dropout_rng, jax.local_device_count())
-    logging.info("Initialized TrainState")
-
     # Data samplers
-    train_task = get_task(**config.task, dtype=jnp.dtype(config.dtype))
-    j_sample_train_batch = jax.jit(get_sharded_batch_sampler(train_task))
-    j_samplers_eval_batch = {
-        get_task_name(task): jax.jit(get_sharded_batch_sampler(task))
+    train_task = get_task(**config.task, dtype=dtype, device=device)
+    sample_train_batch = get_batch_sampler(train_task)
+    batch_samplers = {
+        get_task_name(task): get_batch_sampler(task)
         for task in train_task.get_default_eval_tasks(**config.eval)
     }
     logging.info("Initialized Data Samplers")
 
-    # Steps
-    p_train_step = jax.pmap(train_step, axis_name="device", donate_argnums=0)
-    p_eval_step = jax.pmap(eval_step, axis_name="device")
-    logging.info("Pmap'd Steps")
-
     # Evaluate baselines
     logging.info("Evaluate Baselines...")
-    bsln_preds = get_bsln_preds(train_task, j_samplers_eval_batch, config.eval.n_samples, config.eval.batch_size)
+    bsln_preds = get_bsln_preds(train_task, batch_samplers, config.eval.n_samples, config.eval.batch_size, device)
 
     # Loggers
     log = _init_log(bsln_preds, config.task.n_dims)
@@ -125,21 +106,26 @@ def train(config: ConfigDict) -> None:
     # Training loop
     logging.info("Start Train Loop")
     for i in range(1, config.training.total_steps + 1):
+        # Update learning rate
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_schedule(i)
+
         # Train step
-        data, _, targets = j_sample_train_batch(i)
-        state = p_train_step(state, data, targets, dropout_rngs)
+        data, _, targets = sample_train_batch(i)
+        data, targets = data.to(device), targets.to(device)
+        loss = train_step(model, optimizer, data, targets)
 
         # Evaluate
         if i % config.eval.every == 0 or i == config.training.total_steps:
             # Log step and lr
-            logging.info(f"Step: {i}")
+            logging.info(f"Step: {i}, Loss: {loss:.6f}")
             log["train/step"].append(i)
-            log["train/lr"].append(lr(i).item())
-            wandb.log({"train/lr": lr(i).item()}, step=i)
+            log["train/lr"].append(lr_schedule(i))
+            wandb.log({"train/lr": lr_schedule(i), "train/loss": loss}, step=i)
+
             # Evaluate model
-            eval_preds = get_model_preds(
-                state, p_eval_step, j_samplers_eval_batch, config.eval.n_samples, config.eval.batch_size
-            )
+            eval_preds = get_model_preds(model, batch_samplers, config.eval.n_samples, config.eval.batch_size, device)
+
             # Log model evaluation
             for _task_name, _task_preds in bsln_preds.items():
                 for _bsln_name, _bsln_preds in _task_preds.items():
@@ -148,14 +134,16 @@ def train(config: ConfigDict) -> None:
                     wandb.log({f"eval/{_task_name}/{_bsln_name}": _errs.mean().item()}, step=i)
 
     # Checkpoint
-    ckpter = oc.AsyncCheckpointer(oc.PyTreeCheckpointHandler())
-    checkpoints.save_checkpoint(exp_dir, jax_utils.unreplicate(state), i, orbax_checkpointer=ckpter)
+    checkpoint_path = os.path.join(exp_dir, f"checkpoint_{i}.pt")
+    torch.save({
+        'step': i,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }, checkpoint_path)
 
     # Save logs
-    with tf.io.gfile.GFile(os.path.join(exp_dir, "log.json"), "w") as f:
+    with open(os.path.join(exp_dir, "log.json"), "w") as f:
         f.write(json.dumps(log))
 
-    # Wrap up
-    ckpter.wait_until_finished()
-    jr.normal(jr.PRNGKey(0)).block_until_ready()
+    logging.info("Training completed!")
     return None

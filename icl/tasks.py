@@ -1,9 +1,7 @@
 import dataclasses
 from typing import Any, Callable
 
-import jax
-import jax.numpy as jnp
-from jax import Array
+import torch
 
 from icl.models import Model, get_model
 
@@ -12,7 +10,7 @@ from icl.models import Model, get_model
 ########################################################################################################################
 
 
-Sampler = Callable[[int], tuple[Array, Array, Array]]
+Sampler = Callable[[int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 
 def get_task_name(task: "Task") -> str:
@@ -37,11 +35,12 @@ class NoisyLinearRegression:
     task_scale: float
     noise_scale: float
     dtype: Any
+    device: str = 'cpu'
 
     def __post_init__(self):
-        self.data_key = jax.random.PRNGKey(self.data_seed)
-        self.task_key = jax.random.PRNGKey(self.task_seed)
-        self.noise_key = jax.random.PRNGKey(self.noise_seed)
+        self.data_generator = torch.Generator(device=self.device).manual_seed(self.data_seed)
+        self.task_generator = torch.Generator(device=self.device).manual_seed(self.task_seed)
+        self.noise_generator = torch.Generator(device=self.device).manual_seed(self.noise_seed)
         self.task_pool = self.generate_task_pool() if self.n_tasks > 0 else None
 
     @property
@@ -49,47 +48,47 @@ class NoisyLinearRegression:
         return f"NoisyLinReg({self.n_tasks})"
 
     @classmethod
-    def from_task_pool(cls, task_pool: Array, **kwargs) -> "NoisyLinearRegression":
+    def from_task_pool(cls, task_pool: torch.Tensor, **kwargs) -> "NoisyLinearRegression":
         assert kwargs["n_tasks"] == task_pool.shape[0]
         task = cls(**kwargs)
         task.task_pool = task_pool
         return task
 
-    def generate_task_pool(self) -> Array:
-        key = jax.random.fold_in(self.task_key, 0)
+    def generate_task_pool(self) -> torch.Tensor:
+        gen = torch.Generator(device=self.device).manual_seed(self.task_seed)
         shape = self.n_tasks, self.n_dims, 1
-        tasks = jax.random.normal(key, shape, self.dtype) * self.task_scale
+        tasks = torch.randn(shape, dtype=self.dtype, device=self.device, generator=gen) * self.task_scale
         return tasks
 
-    def sample_data(self, step: int) -> Array:
-        key = jax.random.fold_in(self.data_key, step)
+    def sample_data(self, step: int) -> torch.Tensor:
+        gen = torch.Generator(device=self.device).manual_seed(self.data_seed + step)
         shape = self.batch_size, self.n_points, self.n_dims
-        data = jax.random.normal(key, shape, self.dtype) * self.data_scale
+        data = torch.randn(shape, dtype=self.dtype, device=self.device, generator=gen) * self.data_scale
         return data
 
-    def sample_tasks(self, step: int) -> Array:
-        key = jax.random.fold_in(self.task_key, step)
+    def sample_tasks(self, step: int) -> torch.Tensor:
+        gen = torch.Generator(device=self.device).manual_seed(self.task_seed + step)
         if self.n_tasks > 0:
-            idxs = jax.random.choice(key, self.n_tasks, (self.batch_size,))
+            idxs = torch.randint(0, self.n_tasks, (self.batch_size,), generator=gen, device=self.device)
             tasks = self.task_pool[idxs]
         else:
             shape = self.batch_size, self.n_dims, 1
-            tasks = jax.random.normal(key, shape, self.dtype) * self.task_scale
+            tasks = torch.randn(shape, dtype=self.dtype, device=self.device, generator=gen) * self.task_scale
         return tasks
 
-    def evaluate(self, data: Array, tasks: Array, step: int) -> Array:
+    def evaluate(self, data: torch.Tensor, tasks: torch.Tensor, step: int) -> torch.Tensor:
         targets = (data @ tasks)[:, :, 0]
-        key = jax.random.fold_in(self.noise_key, step)
-        noise = jax.random.normal(key, targets.shape, self.dtype) * self.noise_scale
+        gen = torch.Generator(device=self.device).manual_seed(self.noise_seed + step)
+        noise = torch.randn(targets.shape, dtype=self.dtype, device=self.device, generator=gen) * self.noise_scale
         return targets + noise
 
-    def sample_batch(self, step: int) -> tuple[Array, Array, Array]:
+    def sample_batch(self, step: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         data, tasks = self.sample_data(step), self.sample_tasks(step)
         targets = self.evaluate(data, tasks, step)
         return data, tasks, targets
 
     @staticmethod
-    def evaluate_oracle(data: Array, tasks: Array) -> Array:
+    def evaluate_oracle(data: torch.Tensor, tasks: torch.Tensor) -> torch.Tensor:
         targets = (data @ tasks)[:, :, 0]
         return targets
 
@@ -109,7 +108,7 @@ class NoisyLinearRegression:
         eval_tasks = [self.__class__(**config)]
         if self.n_tasks > 0:
             config["n_tasks"] = self.n_tasks
-            eval_tasks.append(NoisyLinearRegression.from_task_pool(**config, task_pool=self.task_pool.copy()))
+            eval_tasks.append(NoisyLinearRegression.from_task_pool(**config, task_pool=self.task_pool.clone()))
         return eval_tasks
 
     def get_default_eval_models(self) -> list[Model]:
@@ -118,7 +117,7 @@ class NoisyLinearRegression:
             assert self.task_scale == 1.0  # TODO
             models.append(
                 get_model(
-                    name="discrete_mmse", scale=self.noise_scale, task_pool=self.task_pool.copy(), dtype=self.dtype
+                    name="discrete_mmse", scale=self.noise_scale, task_pool=self.task_pool.clone(), dtype=self.dtype
                 )
             )
         return models

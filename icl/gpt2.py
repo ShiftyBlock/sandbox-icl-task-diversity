@@ -1,14 +1,15 @@
 """Implementation based on nanoGPT (https://github.com/karpathy/nanoGPT)
 """
 from typing import Any
+from dataclasses import dataclass
 
-import flax.linen as nn
-import jax.numpy as jnp
-from flax import struct
-from jax import Array
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 
-@struct.dataclass
+@dataclass
 class GPT2Config:
     block_size: int
     n_layer: int
@@ -16,92 +17,115 @@ class GPT2Config:
     n_embd: int
     dropout: float = 0.0
     bias: bool = True
-    dtype: Any = jnp.float32
-
-
-# Linear weights and Embedding weights are initialized with mean 0, stddev 0.02 normal random variables.
-# Linear biases are initialized to 0 which is the default.
-# Residual projection weights get scaled by a factor of 1/sqrt(2 * n_layer)
-# Layer norm weights are initialized to 1 (default), biases are initialized to 0 (default), and epsilon is set to 1e-5
-init_fn = nn.initializers.normal(0.02)
-get_scaled_init_fn = lambda n_layer: nn.initializers.normal(0.02 / jnp.sqrt(2 * n_layer))
+    dtype: Any = torch.float32
 
 
 class GPT2SelfAttention(nn.Module):
-    config: GPT2Config
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        self.config = config
+        assert config.n_embd % config.n_head == 0
 
-    def setup(self):
-        self.c_attn = nn.Dense(3 * self.config.n_embd, self.config.bias, self.config.dtype, kernel_init=init_fn)
-        self.c_proj = nn.Dense(
-            self.config.n_embd, self.config.bias, self.config.dtype, kernel_init=get_scaled_init_fn(self.config.n_layer)
-        )
-        self.attn_dropout = nn.Dropout(self.config.dropout)
-        self.resid_droput = nn.Dropout(self.config.dropout)
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias, dtype=config.dtype)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias, dtype=config.dtype)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
 
-    def __call__(self, x: Array, training: bool = False) -> Array:
-        B, T, C = x.shape  # batch_size, block_size, n_embd
-        q, k, v = jnp.split(self.c_attn(x), 3, axis=2)
-        q = q.reshape(B, T, self.config.n_head, C // self.config.n_head).transpose(0, 2, 1, 3)  # (B, nh, T, hs)
-        k = k.reshape(B, T, self.config.n_head, C // self.config.n_head).transpose(0, 2, 1, 3)  # (B, nh, T, hs)
-        v = v.reshape(B, T, self.config.n_head, C // self.config.n_head).transpose(0, 2, 1, 3)  # (B, nh, T, hs)
-        mask = jnp.tril(jnp.ones((1, 1, self.config.block_size, self.config.block_size))).astype(bool)
-        att = q @ k.transpose(0, 1, 3, 2) / jnp.sqrt(k.shape[-1])  # (B, nh, T, T)
-        att = jnp.where(mask, att, jnp.finfo(self.config.dtype).min)
-        att = nn.softmax(att, axis=-1)
-        att = self.attn_dropout(att, deterministic=not training)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))
+
+    def forward(self, x: torch.Tensor, training: bool = False) -> torch.Tensor:
+        B, T, C = x.size()  # batch_size, block_size, n_embd
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.config.n_embd, dim=2)
+        k = k.view(B, T, self.config.n_head, C // self.config.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.config.n_head, C // self.config.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.config.n_head, C // self.config.n_head).transpose(1, 2)  # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att) if training else att
         y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
-        y = self.resid_droput(self.c_proj(y), deterministic=not training)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y)) if training else self.c_proj(y)
         return y
 
 
 class GPT2MLP(nn.Module):
-    config: GPT2Config
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        self.config = config
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias, dtype=config.dtype)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias, dtype=config.dtype)
+        self.dropout = nn.Dropout(config.dropout)
 
-    def setup(self):
-        self.c_fc = nn.Dense(4 * self.config.n_embd, self.config.bias, self.config.dtype, kernel_init=init_fn)
-        self.c_proj = nn.Dense(
-            self.config.n_embd, self.config.bias, self.config.dtype, kernel_init=get_scaled_init_fn(self.config.n_layer)
-        )
-        self.dropout = nn.Dropout(self.config.dropout)
-
-    def __call__(self, x: Array, training: bool = False) -> Array:
+    def forward(self, x: torch.Tensor, training: bool = False) -> torch.Tensor:
         x = self.c_fc(x)
-        x = nn.gelu(x, approximate=True)
+        x = F.gelu(x, approximate='tanh')
         x = self.c_proj(x)
-        x = self.dropout(x, deterministic=not training)
+        x = self.dropout(x) if training else x
         return x
 
 
 class GPT2Block(nn.Module):
-    config: GPT2Config
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        self.config = config
+        self.ln_1 = nn.LayerNorm(config.n_embd, eps=1e-5, bias=config.bias, dtype=config.dtype)
+        self.attn = GPT2SelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd, eps=1e-5, bias=config.bias, dtype=config.dtype)
+        self.mlp = GPT2MLP(config)
 
-    def setup(self):
-        self.ln_1 = nn.LayerNorm(1e-5, self.config.dtype, use_bias=self.config.bias)
-        self.attn = GPT2SelfAttention(self.config)
-        self.ln_2 = nn.LayerNorm(1e-5, self.config.dtype, use_bias=self.config.bias)
-        self.mlp = GPT2MLP(self.config)
-
-    def __call__(self, x: Array, training: bool = False) -> Array:
+    def forward(self, x: torch.Tensor, training: bool = False) -> torch.Tensor:
         x = x + self.attn(self.ln_1(x), training=training)
         x = x + self.mlp(self.ln_2(x), training=training)
         return x
 
 
 class GPT2Model(nn.Module):
-    config: GPT2Config
+    def __init__(self, config: GPT2Config):
+        super().__init__()
+        self.config = config
 
-    def setup(self):
-        self.wpe = nn.Embed(self.config.block_size, self.config.n_embd, self.config.dtype, embedding_init=init_fn)
-        self.drop = nn.Dropout(self.config.dropout)
-        self.hs = [GPT2Block(self.config) for _ in range(self.config.n_layer)]
-        self.ln_f = nn.LayerNorm(1e-5, self.config.dtype, use_bias=self.config.bias)
+        self.wpe = nn.Embedding(config.block_size, config.n_embd, dtype=config.dtype)
+        self.drop = nn.Dropout(config.dropout)
+        self.hs = nn.ModuleList([GPT2Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd, eps=1e-5, bias=config.bias, dtype=config.dtype)
 
-    def __call__(self, input_embds: Array, training: bool = False) -> Array:
-        pos = jnp.expand_dims(jnp.arange(self.config.block_size), axis=0)  # (1, T)
+        # init all weights
+        self.apply(self._init_weights)
+        # apply special scaled init to the residual projections, per GPT-2 paper
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
+    def forward(self, input_embds: torch.Tensor, training: bool = False) -> torch.Tensor:
+        B, T, C = input_embds.size()
+        pos = torch.arange(0, T, dtype=torch.long, device=input_embds.device).unsqueeze(0)  # (1, T)
         pos_embds = self.wpe(pos)  # (1, T, n_embd)
-        x = input_embds + pos_embds  #  (B, T, n_embd)
-        x = self.drop(x, deterministic=not training)
+        x = input_embds + pos_embds  # (B, T, n_embd)
+        x = self.drop(x) if training else x
         for h in self.hs:
             x = h(x, training=training)
         x = self.ln_f(x)
