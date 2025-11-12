@@ -1,9 +1,12 @@
+"""Task definitions for in-context learning."""
+from __future__ import annotations
+
 import dataclasses
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 import torch
 
-from icl.models import Model, get_model
+from icl.models import BaseModel, create_model
 
 ########################################################################################################################
 # Utilities                                                                                                            #
@@ -111,12 +114,12 @@ class NoisyLinearRegression:
             eval_tasks.append(NoisyLinearRegression.from_task_pool(**config, task_pool=self.task_pool.clone()))
         return eval_tasks
 
-    def get_default_eval_models(self) -> list[Model]:
-        models = [get_model(name="ridge", lam=self.noise_scale**2 / self.task_scale**2, dtype=self.dtype)]
+    def get_default_eval_models(self) -> list[BaseModel]:
+        models = [create_model(name="ridge", lam=self.noise_scale**2 / self.task_scale**2, dtype=self.dtype)]
         if self.n_tasks > 0:
             assert self.task_scale == 1.0  # TODO
             models.append(
-                get_model(
+                create_model(
                     name="discrete_mmse", scale=self.noise_scale, task_pool=self.task_pool.clone(), dtype=self.dtype
                 )
             )
@@ -124,12 +127,28 @@ class NoisyLinearRegression:
 
 
 ########################################################################################################################
-# Get Task                                                                                                             #
+# Task Factory                                                                                                         #
 ########################################################################################################################
 
 Task = NoisyLinearRegression
 
 
-def get_task(name: str, **kwargs) -> Task:
+def create_task(name: str, **kwargs) -> Task:
+    """Factory function for creating tasks.
+
+    Args:
+        name: Task name ('noisy_linear_regression')
+        **kwargs: Task-specific arguments
+
+    Returns:
+        Instantiated task
+
+    Raises:
+        ValueError: If task name is unknown
+    """
     tasks = {"noisy_linear_regression": NoisyLinearRegression}
+
+    if name not in tasks:
+        raise ValueError(f"Unknown task: {name}. Choose from: {list(tasks.keys())}")
+
     return tasks[name](**kwargs)

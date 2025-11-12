@@ -1,9 +1,12 @@
+"""Evaluation utilities for in-context learning."""
+from __future__ import annotations
+
 from typing import Callable
 
 import torch
 import torch.nn as nn
 
-from icl.models import Model, get_model_name
+from icl.models import BaseModel, get_model_name
 from icl.tasks import Sampler, Task
 
 # Preds = {
@@ -25,7 +28,7 @@ def get_oracle_step(task: Task) -> Callable[[torch.Tensor, torch.Tensor], torch.
     return step
 
 
-def get_baseline_step(model: Model) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+def get_baseline_step(model: BaseModel) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     def step(data: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         preds = model(data, targets)
         return preds

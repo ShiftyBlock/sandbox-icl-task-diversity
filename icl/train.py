@@ -5,12 +5,12 @@ import logging
 import torch
 import torch.nn as nn
 
-import icl.utils as u
-import wandb
+from icl import utils
 from icl.evaluate import Preds, get_bsln_preds, get_model_preds, mse
-from icl.models import Transformer, get_model
+from icl.models import Transformer, create_model
 from icl.optim import get_optimizer_and_lr_schedule
-from icl.tasks import Sampler, Task, get_task, get_task_name
+from icl.tasks import Sampler, Task, create_task, get_task_name
+import wandb
 
 
 def initialize(model: Transformer, config, device: str) -> torch.nn.Module:
@@ -63,30 +63,29 @@ def train(config) -> None:
     logging.info(f"Using device: {device}")
 
     # Setup train experiment
-    exp_name = f"train_{u.get_hash(config)}"
-    exp_dir = os.path.join(config.work_dir, exp_name)
+    exp_name = f"train_{utils.compute_config_hash(config)}"
+    exp_dir = config.work_dir / exp_name
     logging.info(f"Train Experiment\nNAME: {exp_name}\nCONFIG:\n{config}")
 
     # Experiment completed?
-    if os.path.exists(os.path.join(exp_dir, "log.json")):
+    if (exp_dir / "log.json").exists():
         logging.info(f"{exp_name} already completed")
         return None
 
     # Config
-    os.makedirs(exp_dir, exist_ok=True)
-    with open(os.path.join(exp_dir, "config.json"), "w") as f:
-        f.write(config.to_json())
+    exp_dir.mkdir(parents=True, exist_ok=True)
+    (exp_dir / "config.json").write_text(config.to_json())
 
     # Model, optimizer and lr schedule
     dtype = getattr(torch, config.dtype)
-    model = get_model(**vars(config.model), dtype=dtype)
-    logging.info(u.tabulate_model(model, config.task.n_dims, config.task.n_points, config.task.batch_size))
+    model = create_model(**vars(config.model), dtype=dtype)
+    logging.info(utils.get_model_summary(model, config.task.n_dims, config.task.n_points, config.task.batch_size))
     model = initialize(model, config, device)
     optimizer, lr_schedule = get_optimizer_and_lr_schedule(**vars(config.training), model=model)
     logging.info("Initialized Model, Optimizer and LR Schedule")
 
     # Data samplers
-    train_task = get_task(**vars(config.task), dtype=dtype, device=device)
+    train_task = create_task(**vars(config.task), dtype=dtype, device=device)
     sample_train_batch = get_batch_sampler(train_task)
     batch_samplers = {
         get_task_name(task): get_batch_sampler(task)
@@ -133,7 +132,7 @@ def train(config) -> None:
                     wandb.log({f"eval/{_task_name}/{_bsln_name}": _errs.mean().item()}, step=i)
 
     # Checkpoint
-    checkpoint_path = os.path.join(exp_dir, f"checkpoint_{i}.pt")
+    checkpoint_path = exp_dir / f"checkpoint_{i}.pt"
     torch.save({
         'step': i,
         'model_state_dict': model.state_dict(),
@@ -141,8 +140,7 @@ def train(config) -> None:
     }, checkpoint_path)
 
     # Save logs
-    with open(os.path.join(exp_dir, "log.json"), "w") as f:
-        f.write(json.dumps(log))
+    (exp_dir / "log.json").write_text(json.dumps(log))
 
     logging.info("Training completed!")
     return None
