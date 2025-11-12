@@ -1,49 +1,117 @@
-from ml_collections import ConfigDict
+from dataclasses import dataclass, asdict
+import json
 
 
-def get_config() -> ConfigDict:
-    config = ConfigDict()
+@dataclass
+class TaskConfig:
+    name: str = "noisy_linear_regression"
+    n_tasks: int = 1_048_576
+    n_dims: int = 8
+    n_points: int = 16
+    batch_size: int = 256
+    data_seed: int = 101
+    task_seed: int = 102
+    noise_seed: int = 103
+    data_scale: float = 1.0
+    task_scale: float = 1.0
+    noise_scale: float = 0.5
 
-    config.dtype = "float32"
-    config.work_dir = ""  # Specify working directory
 
-    config.task = ConfigDict()
-    config.task.name = "noisy_linear_regression"
-    config.task.n_tasks = 1_048_576
-    config.task.n_dims = 8
-    config.task.n_points = 16
-    config.task.batch_size = 256
-    config.task.data_seed = 101
-    config.task.task_seed = 102
-    config.task.noise_seed = 103
-    config.task.data_scale = 1.0
-    config.task.task_scale = 1.0
-    config.task.noise_scale = 0.5
+@dataclass
+class ModelConfig:
+    name: str = "transformer"
+    n_points: int = 16
+    n_layer: int = 8
+    n_embd: int = 128
+    n_head: int = 2
+    seed: int = 100
 
-    config.model = ConfigDict()
-    config.model.name = "transformer"
-    config.model.n_points = 16
-    config.model.n_layer = 8
-    config.model.n_embd = 128
-    config.model.n_head = 2
-    config.model.seed = 100
 
-    config.training = ConfigDict()
-    config.training.optimizer = "adam"
-    config.training.lr = 1e-3
-    config.training.schedule = "triangle"
-    config.training.warmup_steps = 250_000
-    config.training.total_steps = 500_000
+@dataclass
+class TrainingConfig:
+    optimizer: str = "adam"
+    lr: float = 1e-3
+    schedule: str = "triangle"
+    warmup_steps: int = 250_000
+    total_steps: int = 500_000
+    weight_decay: float = 0.0
 
-    config.eval = ConfigDict()
-    config.eval.n_samples = 1_048_576
-    config.eval.batch_size = 4_096
-    config.eval.data_seed = 104
-    config.eval.task_seed = 105
-    config.eval.noise_seed = 106
-    config.eval.every = 1000
 
-    config.wandb = ConfigDict()
-    config.wandb.project = ""  # Specify wandb project
+@dataclass
+class EvalConfig:
+    n_samples: int = 1_048_576
+    batch_size: int = 4_096
+    data_seed: int = 104
+    task_seed: int = 105
+    noise_seed: int = 106
+    every: int = 1000
 
-    return config
+
+@dataclass
+class WandbConfig:
+    project: str = ""  # Specify wandb project
+    entity: str = ""
+    mode: str = "online"
+
+
+@dataclass
+class Config:
+    dtype: str = "float32"
+    work_dir: str = ""  # Specify working directory
+    task: TaskConfig = None
+    model: ModelConfig = None
+    training: TrainingConfig = None
+    eval: EvalConfig = None
+    wandb: WandbConfig = None
+
+    def __post_init__(self):
+        if self.task is None:
+            self.task = TaskConfig()
+        if self.model is None:
+            self.model = ModelConfig()
+        if self.training is None:
+            self.training = TrainingConfig()
+        if self.eval is None:
+            self.eval = EvalConfig()
+        if self.wandb is None:
+            self.wandb = WandbConfig()
+
+    def to_dict(self):
+        """Convert config to dictionary."""
+        return asdict(self)
+
+    def to_json(self, **kwargs):
+        """Convert config to JSON string."""
+        return json.dumps(self.to_dict(), **kwargs)
+
+    @classmethod
+    def from_dict(cls, config_dict):
+        """Create config from dictionary."""
+        task = TaskConfig(**config_dict.get('task', {}))
+        model = ModelConfig(**config_dict.get('model', {}))
+        training = TrainingConfig(**config_dict.get('training', {}))
+        eval_cfg = EvalConfig(**config_dict.get('eval', {}))
+        wandb = WandbConfig(**config_dict.get('wandb', {}))
+
+        return cls(
+            dtype=config_dict.get('dtype', 'float32'),
+            work_dir=config_dict.get('work_dir', ''),
+            task=task,
+            model=model,
+            training=training,
+            eval=eval_cfg,
+            wandb=wandb
+        )
+
+
+def get_config() -> Config:
+    """Get default configuration."""
+    return Config(
+        dtype="float32",
+        work_dir="",  # Specify working directory
+        task=TaskConfig(),
+        model=ModelConfig(),
+        training=TrainingConfig(),
+        eval=EvalConfig(),
+        wandb=WandbConfig()
+    )

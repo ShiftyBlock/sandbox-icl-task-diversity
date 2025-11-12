@@ -1,7 +1,5 @@
-absl-py==1.4.0
 black==23.3.0
 matplotlib==3.7.1
-ml-collections==0.1.1
 numpy==1.23.5
 pandas==1.5.3
 seaborn==0.12.2

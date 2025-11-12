@@ -4,7 +4,6 @@ import logging
 
 import torch
 import torch.nn as nn
-from ml_collections import ConfigDict
 
 import icl.utils as u
 import wandb
@@ -14,7 +13,7 @@ from icl.optim import get_optimizer_and_lr_schedule
 from icl.tasks import Sampler, Task, get_task, get_task_name
 
 
-def initialize(model: Transformer, config: ConfigDict, device: str) -> torch.nn.Module:
+def initialize(model: Transformer, config, device: str) -> torch.nn.Module:
     model = model.to(device)
     return model
 
@@ -58,7 +57,7 @@ def _init_log(bsln_preds: Preds, n_dims: int) -> dict:
     return log
 
 
-def train(config: ConfigDict) -> None:
+def train(config) -> None:
     # Setup device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logging.info(f"Using device: {device}")
