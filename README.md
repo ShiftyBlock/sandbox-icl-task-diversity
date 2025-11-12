@@ -23,10 +23,21 @@ pip install -e .
 
 ## Training
 
-To train a model, modify `icl/configs/example.py` and then run:
+To train a model, you can either:
+
+1. Use the example config:
 ```sh
 python run.py --config=icl/configs/example.py
 ```
+
+2. Or create your own config file by copying and modifying `icl/configs/example.py`:
+```sh
+cp icl/configs/example.py icl/configs/my_config.py
+# Edit my_config.py with your settings
+python run.py --config=icl/configs/my_config.py
+```
+
+The config files use Python dataclasses for type safety and modern Python practices.
 
 ## Hardware Requirements
 
@@ -42,7 +53,9 @@ The original codebase was designed for Google's TPU Research Cloud using JAX/Fla
 - Supports CPU and GPU (CUDA) training
 - Maintains the same model architecture and training procedures
 - Uses PyTorch's native optimizers and learning rate schedulers
-- Provides equivalent functionality with PyTorch idioms
+- Uses Python dataclasses for configuration instead of ml_collections
+- Uses argparse instead of absl flags for command-line arguments
+- Provides equivalent functionality with modern PyTorch and Python idioms
 
 ## Citation
 

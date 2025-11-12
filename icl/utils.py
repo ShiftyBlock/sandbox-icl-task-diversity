@@ -1,22 +1,12 @@
 import hashlib
 
 import torch
-from ml_collections import ConfigDict
 
 from icl.models import Transformer
 
 
-def filter_config(config: ConfigDict) -> ConfigDict:
-    with config.unlocked():
-        for k, v in list(config.items()):
-            if v is None:
-                del config[k]
-            elif isinstance(v, ConfigDict):
-                config[k] = filter_config(v)
-    return config
-
-
-def get_hash(config: ConfigDict) -> str:
+def get_hash(config) -> str:
+    """Generate hash from config object."""
     return hashlib.md5(config.to_json(sort_keys=True).encode("utf-8")).hexdigest()
 
 
