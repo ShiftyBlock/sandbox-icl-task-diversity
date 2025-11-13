@@ -4,6 +4,7 @@ import logging
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 import icl.utils as u
 import wandb
@@ -104,7 +105,7 @@ def train(config) -> None:
 
     # Training loop
     logging.info("Start Train Loop")
-    for i in range(1, config.training.total_steps + 1):
+    for i in tqdm(range(1, config.training.total_steps + 1), desc="Training", unit="step"):
         # Update learning rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr_schedule(i)

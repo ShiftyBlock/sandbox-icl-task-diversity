@@ -2,6 +2,7 @@ from typing import Callable
 
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 from icl.models import Model, get_model_name
 from icl.tasks import Sampler, Task
@@ -50,7 +51,7 @@ def get_bsln_preds(train_task: Task, batch_samplers: dict[str, Sampler], n_sampl
             preds[task_name][model_name] = []
 
         # Accumulate preds...
-        for i in range(1, n_samples // batch_size + 1):
+        for i in tqdm(range(1, n_samples // batch_size + 1), desc=f"Eval baseline: {task_name}", leave=False, unit="batch"):
             xs, ws, ys = sample_batch(i)
             xs, ws, ys = xs.to(device), ws.to(device), ys.to(device)
             _, n_points = ys.shape
@@ -80,7 +81,7 @@ def get_model_preds(
 
     for task_name, sample_batch in batch_samplers.items():
         preds[task_name] = {"Transformer": []}
-        for i in range(1, n_samples // batch_size + 1):
+        for i in tqdm(range(1, n_samples // batch_size + 1), desc=f"Eval model: {task_name}", leave=False, unit="batch"):
             xs, _, ys = sample_batch(i)
             xs, ys = xs.to(device), ys.to(device)
 
