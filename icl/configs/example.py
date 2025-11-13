@@ -1,9 +1,15 @@
-from dataclasses import dataclass, asdict
+"""Example configuration for ICL training."""
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+from typing import Literal
 import json
 
 
-@dataclass
+@dataclass(frozen=True)
 class TaskConfig:
+    """Configuration for task generation."""
     name: str = "noisy_linear_regression"
     n_tasks: int = 1_048_576
     n_dims: int = 8
@@ -17,8 +23,9 @@ class TaskConfig:
     noise_scale: float = 0.5
 
 
-@dataclass
+@dataclass(frozen=True)
 class ModelConfig:
+    """Configuration for model architecture."""
     name: str = "transformer"
     n_points: int = 16
     n_layer: int = 8
@@ -27,18 +34,20 @@ class ModelConfig:
     seed: int = 100
 
 
-@dataclass
+@dataclass(frozen=True)
 class TrainingConfig:
-    optimizer: str = "adam"
+    """Configuration for training hyperparameters."""
+    optimizer: Literal["adam", "adamw"] = "adam"
     lr: float = 1e-3
-    schedule: str = "triangle"
+    schedule: Literal["triangle", "warmup_cosine_decay"] = "triangle"
     warmup_steps: int = 250_000
     total_steps: int = 500_000
     weight_decay: float = 0.0
 
 
-@dataclass
+@dataclass(frozen=True)
 class EvalConfig:
+    """Configuration for evaluation."""
     n_samples: int = 1_048_576
     batch_size: int = 4_096
     data_seed: int = 104
@@ -47,71 +56,51 @@ class EvalConfig:
     every: int = 1000
 
 
-@dataclass
+@dataclass(frozen=True)
 class WandbConfig:
-    project: str = ""  # Specify wandb project
+    """Configuration for Weights & Biases logging."""
+    project: str = ""
     entity: str = ""
-    mode: str = "online"
+    mode: Literal["online", "offline", "disabled"] = "online"
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
+    """Main configuration object."""
     dtype: str = "float32"
-    work_dir: str = ""  # Specify working directory
-    task: TaskConfig = None
-    model: ModelConfig = None
-    training: TrainingConfig = None
-    eval: EvalConfig = None
-    wandb: WandbConfig = None
+    work_dir: Path = field(default_factory=lambda: Path.cwd() / "experiments")
+    task: TaskConfig = field(default_factory=TaskConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
-    def __post_init__(self):
-        if self.task is None:
-            self.task = TaskConfig()
-        if self.model is None:
-            self.model = ModelConfig()
-        if self.training is None:
-            self.training = TrainingConfig()
-        if self.eval is None:
-            self.eval = EvalConfig()
-        if self.wandb is None:
-            self.wandb = WandbConfig()
+    def to_dict(self) -> dict:
+        """Convert config to dictionary, handling Path objects."""
+        d = asdict(self)
+        d['work_dir'] = str(self.work_dir)
+        return d
 
-    def to_dict(self):
-        """Convert config to dictionary."""
-        return asdict(self)
-
-    def to_json(self, **kwargs):
-        """Convert config to JSON string."""
+    def to_json(self, **kwargs) -> str:
+        """Serialize config to JSON string."""
         return json.dumps(self.to_dict(), **kwargs)
 
     @classmethod
-    def from_dict(cls, config_dict):
+    def from_dict(cls, data: dict) -> Config:
         """Create config from dictionary."""
-        task = TaskConfig(**config_dict.get('task', {}))
-        model = ModelConfig(**config_dict.get('model', {}))
-        training = TrainingConfig(**config_dict.get('training', {}))
-        eval_cfg = EvalConfig(**config_dict.get('eval', {}))
-        wandb = WandbConfig(**config_dict.get('wandb', {}))
+        work_dir = Path(data.get('work_dir', Path.cwd() / "experiments"))
 
         return cls(
-            dtype=config_dict.get('dtype', 'float32'),
-            work_dir=config_dict.get('work_dir', ''),
-            task=task,
-            model=model,
-            training=training,
-            eval=eval_cfg,
-            wandb=wandb
+            dtype=data.get('dtype', 'float32'),
+            work_dir=work_dir,
+            task=TaskConfig(**data.get('task', {})),
+            model=ModelConfig(**data.get('model', {})),
+            training=TrainingConfig(**data.get('training', {})),
+            eval=EvalConfig(**data.get('eval', {})),
+            wandb=WandbConfig(**data.get('wandb', {}))
         )
 
 
 def get_config() -> Config:
     """Get default configuration."""
-    return Config(
-        dtype="float32",
-        work_dir="",  # Specify working directory
-        task=TaskConfig(),
-        model=ModelConfig(),
-        training=TrainingConfig(),
-        eval=EvalConfig(),
-        wandb=WandbConfig()
-    )
+    return Config()
