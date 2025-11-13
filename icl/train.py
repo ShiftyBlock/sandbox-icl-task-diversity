@@ -11,6 +11,8 @@ from icl.models import Transformer, create_model
 from icl.optim import get_optimizer_and_lr_schedule
 from icl.tasks import Sampler, Task, create_task, get_task_name
 import wandb
+from tqdm import tqdm
+
 
 
 def initialize(model: Transformer, config, device: str) -> torch.nn.Module:
@@ -103,7 +105,7 @@ def train(config) -> None:
 
     # Training loop
     logging.info("Start Train Loop")
-    for i in range(1, config.training.total_steps + 1):
+    for i in tqdm(range(1, config.training.total_steps + 1), desc="Training", unit="step"):
         # Update learning rate
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr_schedule(i)
